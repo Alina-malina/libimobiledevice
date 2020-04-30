@@ -184,7 +184,7 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	if (IDEVICE_E_SUCCESS != idevice_new(&device, udid)) {
+	if (IDEVICE_E_SUCCESS != idevice_new_with_options(&device, udid, IDEVICE_LOOKUP_USBMUX | IDEVICE_LOOKUP_NETWORK)) {
 		if (udid) {
 			printf("No device found with udid %s, is it plugged in?\n", udid);
 		} else {

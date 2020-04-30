@@ -649,6 +649,8 @@ static void do_post_notification(idevice_t device, const char *notification)
 	lockdownd_client_free(lockdown);
 }
 
+static int bytes_per_sec = 0;
+
 static void print_progress_real(double progress, int flush)
 {
 	int i = 0;
@@ -660,7 +662,7 @@ static void print_progress_real(double progress, int flush)
 			PRINT_VERBOSE(1, " ");
 		}
 	}
-	PRINT_VERBOSE(1, "] %3.0f%%", progress);
+	PRINT_VERBOSE(1, "] %3.0f%% (%3.1f MB/s)", progress, (double)bytes_per_sec/1048576);
 
 	if (flush > 0) {
 		fflush(stdout);
@@ -987,6 +989,29 @@ static int mb2_receive_filename(mobilebackup2_client_t mobilebackup2, char** fil
 	return nlen;
 }
 
+int timeval_subtract (struct timeval *result, struct timeval *x,struct timeval  *y)  
+{  
+	/* Perform the carry for the later subtraction by updating y. */  
+	if (x->tv_usec < y->tv_usec) {  
+		int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;  
+		y->tv_usec -= 1000000 * nsec;  
+		y->tv_sec += nsec;  
+	}  
+	if (x->tv_usec - y->tv_usec > 1000000) {  
+		int nsec = (y->tv_usec - x->tv_usec) / 1000000;  
+		y->tv_usec += 1000000 * nsec;  
+		y->tv_sec -= nsec;  
+	}	
+
+	/* Compute the time remaining to wait.
+	   tv_usec is certainly positive. */  
+	result->tv_sec = x->tv_sec - y->tv_sec;  
+	result->tv_usec = x->tv_usec - y->tv_usec;  
+
+	/* Return 1 if result is negative. */  
+	return x->tv_sec < y->tv_sec;  
+}
+
 static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_t message, const char *backup_dir)
 {
 	uint64_t backup_real_size = 0;
@@ -1009,6 +1034,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 	char *errdesc = NULL;
 
 	if (!message || (plist_get_node_type(message) != PLIST_ARRAY) || plist_array_get_size(message) < 4 || !backup_dir) return 0;
+
+	struct timeval t1;
+	gettimeofday(&t1, NULL);
 
 	node = plist_array_get_item(message, 3);
 	if (plist_get_node_type(node) == PLIST_UINT) {
@@ -1090,7 +1118,7 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				backup_real_size += blocksize;
 			}
 			if (backup_total_size > 0) {
-				print_progress(backup_real_size, backup_total_size);
+				//print_progress(backup_real_size, backup_total_size);
 			}
 			if (quit_flag)
 				break;
@@ -1133,6 +1161,14 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 
 	if (fname != NULL)
 		free(fname);
+
+	if (errcode == 0) {
+		struct timeval t2;
+		gettimeofday(&t2, NULL);
+		struct timeval tdiff;
+		timeval_subtract(&tdiff, &t2, &t1);
+		bytes_per_sec = (int)((double)backup_real_size / ((double)(tdiff.tv_sec) + (double)tdiff.tv_usec/1000000));
+	}
 
 	/* if there are leftovers to read, finish up cleanly */
 	if ((int)nlen-1 > 0) {
@@ -1438,6 +1474,7 @@ static void print_usage(int argc, char **argv)
 
 int main(int argc, char *argv[])
 {
+	libusbmuxd_set_debug_level(1);
 	idevice_error_t ret = IDEVICE_E_UNKNOWN_ERROR;
 	lockdownd_error_t ldret = LOCKDOWN_E_UNKNOWN_ERROR;
 	int i;
@@ -1450,6 +1487,7 @@ int main(int argc, char *argv[])
 	int result_code = -1;
 	char* backup_directory = NULL;
 	int interactive_mode = 0;
+	int use_network = 0;
 	char* backup_password = NULL;
 	char* newpw = NULL;
 	struct stat st;
@@ -1492,6 +1530,10 @@ int main(int argc, char *argv[])
 		}
 		else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--interactive")) {
 			interactive_mode = 1;
+			continue;
+		}
+		else if (!strcmp(argv[i], "-n") || !strcmp(argv[i], "--network")) {
+			use_network = 1;
 			continue;
 		}
 		else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -1660,7 +1702,7 @@ int main(int argc, char *argv[])
 
 	idevice_t device = NULL;
 	if (udid) {
-		ret = idevice_new(&device, udid);
+		ret = idevice_new_with_options(&device, udid, (use_network) ? IDEVICE_LOOKUP_NETWORK : IDEVICE_LOOKUP_USBMUX);
 		if (ret != IDEVICE_E_SUCCESS) {
 			printf("No device found with udid %s, is it plugged in?\n", udid);
 			return -1;
@@ -1668,7 +1710,7 @@ int main(int argc, char *argv[])
 	}
 	else
 	{
-		ret = idevice_new(&device, NULL);
+		ret = idevice_new_with_options(&device, NULL, (use_network) ? IDEVICE_LOOKUP_NETWORK : IDEVICE_LOOKUP_USBMUX);
 		if (ret != IDEVICE_E_SUCCESS) {
 			printf("No device found, is it plugged in?\n");
 			return -1;

@@ -39,6 +39,7 @@
 
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/syslog_relay.h>
+#include <libimobiledevice/ostrace_relay.h>
 
 static int quit_flag = 0;
 static int exit_on_disconnect = 0;
@@ -64,8 +65,7 @@ static int triggered = 0;
 
 static idevice_t device = NULL;
 static syslog_relay_client_t syslog = NULL;
-
-static const char QUIET_FILTER[] = "CommCenter|SpringBoard|UserEventAgent|WirelessRadioManagerd|aggregated|appstored|backboardd|biometrickitd|bluetoothd|callservicesd|contextstored|corespeechd|dasd|gpsd|homed|identityservicesd|itunesstored|kernel|locationd|mDNSResponder|mediaremoted|mediaserverd|navd|nsurlsessiond|powerd|rapportd|routined|runningboardd|sharingd|symptomsd|thermalmonitord|useractivityd|wifid";
+static ostrace_relay_client_t ostrace = NULL;
 
 enum idevice_options lookup_opts = IDEVICE_LOOKUP_USBMUX | IDEVICE_LOOKUP_NETWORK;
 
@@ -94,12 +94,12 @@ static int lp = 0;
 
 #define TEXT_COLOR(x) if (use_colors) { fwrite(x, 1, sizeof(x), stdout); }
 
-static void add_filter(const char* filterstr)
+static void add_filter(char* filterstr)
 {
 	int filter_len = strlen(filterstr);
-	const char* start = filterstr;
-	const char* end = filterstr + filter_len;
-	const char* p = start;
+	char* start = filterstr;
+	char* end = filterstr + filter_len;
+	char* p = start;
 	while (p <= end) {
 		if ((*p == '|') || (*p == '\0')) {
 			if (p-start > 0) {
@@ -145,8 +145,6 @@ static int find_char(char c, char** p, char* end)
 	}
 	return (**p == c);
 }
-
-static void stop_logging(void);
 
 static void syslog_callback(char c, void *user_data)
 {
@@ -213,10 +211,6 @@ static void syslog_callback(char c, void *user_data)
 						triggered = 1;
 						shall_print = 1;
 					}
-				} else if (num_trigger_filters == 0 && num_untrigger_filters > 0 && !triggered) {
-					shall_print = 0;
-					quit_flag++;
-					break;
 				}
 
 				/* check message filters */
@@ -276,7 +270,6 @@ static void syslog_callback(char c, void *user_data)
 					int found = proc_filter_excluding;
 					int i = 0;
 					for (i = 0; i < num_proc_filters; i++) {
-						if (!proc_filters[i]) continue;
 						if (strncmp(proc_filters[i], process_name_start, process_name_end-process_name_start) == 0) {
 							found = !proc_filter_excluding;
 							break;
@@ -350,7 +343,7 @@ static void syslog_callback(char c, void *user_data)
 			}
 		} while (0);
 
-		if ((num_msg_filters == 0 && num_proc_filters == 0 && num_pid_filters == 0 && num_trigger_filters == 0 && num_untrigger_filters == 0) || shall_print) {
+		if ((num_msg_filters == 0 && num_proc_filters == 0 && num_pid_filters == 0 && num_trigger_filters == 0) || shall_print) {
 			fwrite(linep, 1, lp, stdout);
 			TEXT_COLOR(COLOR_RESET);
 			fflush(stdout);
@@ -383,11 +376,13 @@ static int start_logging(void)
 
 	/* start syslog_relay service */
 	lockdownd_service_descriptor_t svc = NULL;
-	lerr = lockdownd_start_service(lockdown, SYSLOG_RELAY_SERVICE_NAME, &svc);
+	//lerr = lockdownd_start_service(lockdown, SYSLOG_RELAY_SERVICE_NAME, &svc);
+	lerr = lockdownd_start_service(lockdown, OSTRACE_RELAY_SERVICE_NAME, &svc);
 	if (lerr == LOCKDOWN_E_PASSWORD_PROTECTED) {
 		fprintf(stderr, "*** Device is passcode protected, enter passcode on the device to continue ***\n");
 		while (!quit_flag) {
-			lerr = lockdownd_start_service(lockdown, SYSLOG_RELAY_SERVICE_NAME, &svc);
+			//lerr = lockdownd_start_service(lockdown, SYSLOG_RELAY_SERVICE_NAME, &svc);
+			lerr = lockdownd_start_service(lockdown, OSTRACE_RELAY_SERVICE_NAME, &svc);
 			if (lerr != LOCKDOWN_E_PASSWORD_PROTECTED) {
 				break;
 			}
@@ -403,10 +398,13 @@ static int start_logging(void)
 	lockdownd_client_free(lockdown);
 
 	/* connect to syslog_relay service */
-	syslog_relay_error_t serr = SYSLOG_RELAY_E_UNKNOWN_ERROR;
-	serr = syslog_relay_client_new(device, svc, &syslog);
+//	syslog_relay_error_t serr = SYSLOG_RELAY_E_UNKNOWN_ERROR;
+//	serr = syslog_relay_client_new(device, svc, &syslog);
+	ostrace_relay_error_t serr = OSTRACE_RELAY_E_UNKNOWN_ERROR;
+	serr = ostrace_relay_client_new(device, svc, &ostrace);
 	lockdownd_service_descriptor_free(svc);
-	if (serr != SYSLOG_RELAY_E_SUCCESS) {
+	//if (serr != SYSLOG_RELAY_E_SUCCESS) {
+	if (serr != OSTRACE_RELAY_E_SUCCESS) {
 		fprintf(stderr, "ERROR: Could not start service com.apple.syslog_relay.\n");
 		idevice_free(device);
 		device = NULL;
@@ -414,7 +412,8 @@ static int start_logging(void)
 	}
 
 	/* start capturing syslog */
-	serr = syslog_relay_start_capture_raw(syslog, syslog_callback, NULL);
+	//serr = syslog_relay_start_capture_raw(syslog, syslog_callback, NULL);
+	serr = ostrace_relay_start_capture(ostrace, syslog_callback, NULL);
 	if (serr != SYSLOG_RELAY_E_SUCCESS) {
 		fprintf(stderr, "ERROR: Unable tot start capturing syslog.\n");
 		syslog_relay_client_free(syslog);
@@ -437,6 +436,10 @@ static void stop_logging(void)
 	if (syslog) {
 		syslog_relay_client_free(syslog);
 		syslog = NULL;
+	}
+	if (ostrace) {
+		ostrace_relay_client_free(ostrace);
+		ostrace = NULL;
 	}
 
 	if (device) {
@@ -485,25 +488,18 @@ static void print_usage(int argc, char **argv, int is_error)
 	fprintf(is_error ? stderr : stdout, "Usage: %s [OPTIONS]\n", (name ? name + 1: argv[0]));
 	fprintf(is_error ? stderr : stdout,
 	  "Relay syslog of a connected device.\n\n" \
-	  "OPTIONS:\n" \
 	  "  -u, --udid UDID  target specific device by UDID\n" \
 	  "  -n, --network    connect to network device even if available via USB\n" \
-	  "  -x, --exit       exit when device disconnects\n" \
-	  "  -h, --help       prints usage information\n" \
-	  "  -d, --debug      enable communication debugging\n" \
-	  "\n" \
-	  "FILTER OPTIONS:\n" \
-	  "  -m, --match STRING     only print messages that contain STRING\n" \
-	  "  -t, --trigger STRING   start logging when matching STRING\n" \
-	  "  -T, --untrigger STRING  stop logging when matching STRING\n" \
+	  "  -m, --match FILTER     only print messages that contain FILTER\n" \
+	  "  -t, --trigger FILTER   only start logging when matching FILTER\n" \
+	  "  -T, --untrigger FILTER  stop logging when matching FILTER\n" \
 	  "  -p, --process PROCESS  only print messages from matching process(es)\n" \
 	  "  -e, --exclude PROCESS  print all messages except matching process(es)\n" \
 	  "        PROCESS is a process name or multiple process names separated by \"|\".\n" \
-	  "  -q, --quiet      set a filter to exclude common noisy processes\n" \
-	  "  --quiet-list     prints the list of processes for --quiet and exits\n" \
-	  "  -k, --kernel     only print kernel messages\n" \
-	  "  -K, --no-kernel  suppress kernel messages\n" \
-	  "For filter example usage consult idevicesyslog(1) man page.\n" \
+	  "  -q, --quiet      Set a filter to exclude common noisy processes\n" \
+	  "  -h, --help       prints usage information\n" \
+	  "  -d, --debug      enable communication debugging\n" \
+	  "  -x, --exit       exit when device disconnects\n" \
 	  "\n" \
 	  "Homepage: <" PACKAGE_URL ">\n"
 	);
@@ -513,8 +509,6 @@ int main(int argc, char *argv[])
 {
 	int include_filter = 0;
 	int exclude_filter = 0;
-	int include_kernel = 0;
-	int exclude_kernel = 0;
 	int c = 0;
 	const struct option longopts[] = {
 		{ "debug", no_argument, NULL, 'd' },
@@ -528,9 +522,6 @@ int main(int argc, char *argv[])
 		{ "process", required_argument, NULL, 'p' },
 		{ "exclude", required_argument, NULL, 'e' },
 		{ "quiet", no_argument, NULL, 'q' },
-		{ "kernel", no_argument, NULL, 'k' },
-		{ "no-kernel", no_argument, NULL, 'K' },
-		{ "quiet-list", no_argument, NULL, 1 },
 		{ NULL, 0, NULL, 0}
 	};
 
@@ -541,7 +532,7 @@ int main(int argc, char *argv[])
 	signal(SIGPIPE, SIG_IGN);
 #endif
 
-	while ((c = getopt_long(argc, argv, "dhu:nxt:T:m:e:p:qkK", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "dhu:nxt:T:m:e:p:q", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'd':
 			idevice_set_debug_level(1);
@@ -560,7 +551,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'q':
 			exclude_filter++;
-			add_filter(QUIET_FILTER);
+			add_filter((char*)"CommCenter|SpringBoard|UserEventAgent|WirelessRadioManagerd|aggregated|appstored|backboardd|biometrickitd|bluetoothd|callservicesd|contextstored|corespeechd|dasd|gpsd|homed|identityservicesd|itunesstored|locationd|mDNSResponder|mediaremoted|mediaserverd|navd|nsurlsessiond|powerd|rapportd|routined|runningboardd|sharingd|symptomsd|thermalmonitord|useractivityd|wifid");
 			break;
 		case 'p':
 		case 'e':
@@ -624,68 +615,26 @@ int main(int argc, char *argv[])
 				num_untrigger_filters++;
 			}
 			break;
-		case 'k':
-			include_kernel++;
-			break;
-		case 'K':
-			exclude_kernel++;
-			break;
 		case 'x':
 			exit_on_disconnect = 1;
 			break;
 		case 'h':
 			print_usage(argc, argv, 0);
 			return 0;
-		case 1:	{
-			printf("%s\n", QUIET_FILTER);
-			return 0;
-		}
 		default:
 			print_usage(argc, argv, 1);
 			return 2;
 		}
 	}
 
-	if (include_kernel > 0 && exclude_kernel > 0) {
-		fprintf(stderr, "ERROR: -k and -K cannot be used together.\n");
-		print_usage(argc, argv, 1);
-		return 2;
-	}
-
 	if (include_filter > 0 && exclude_filter > 0) {
 		fprintf(stderr, "ERROR: -p and -e/-q cannot be used together.\n");
-		print_usage(argc, argv, 1);
-		return 2;
-	} else if (include_filter > 0 && exclude_kernel > 0) {
-		fprintf(stderr, "ERROR: -p and -K cannot be used together.\n");
 		print_usage(argc, argv, 1);
 		return 2;
 	}
 
 	if (exclude_filter > 0) {
 		proc_filter_excluding = 1;
-		if (include_kernel) {
-			int i = 0;
-			for (i = 0; i < num_proc_filters; i++) {
-				if (!strcmp(proc_filters[i], "kernel")) {
-					free(proc_filters[i]);
-					proc_filters[i] = NULL;
-				}
-			}
-		} else if (exclude_kernel) {
-			add_filter("kernel");
-		}
-	} else {
-		if (include_kernel) {
-			add_filter("kernel");
-		} else if (exclude_kernel) {
-			proc_filter_excluding = 1;
-			add_filter("kernel");
-		}
-	}
-
-	if (num_untrigger_filters > 0 && num_trigger_filters == 0) {
-		triggered = 1;
 	}
 
 	argc -= optind;
@@ -718,38 +667,6 @@ int main(int argc, char *argv[])
 	}
 	idevice_event_unsubscribe();
 	stop_logging();
-
-	if (num_proc_filters > 0) {
-		int i;
-		for (i = 0; i < num_proc_filters; i++) {
-			free(proc_filters[i]);
-		}
-		free(proc_filters);
-	}
-	if (num_pid_filters > 0) {
-		free(pid_filters);
-	}
-	if (num_msg_filters > 0) {
-		int i;
-		for (i = 0; i < num_msg_filters; i++) {
-			free(msg_filters[i]);
-		}
-		free(msg_filters);
-	}
-	if (num_trigger_filters > 0) {
-		int i;
-		for (i = 0; i < num_trigger_filters; i++) {
-			free(trigger_filters[i]);
-		}
-		free(trigger_filters);
-	}
-	if (num_untrigger_filters > 0) {
-		int i;
-		for (i = 0; i < num_untrigger_filters; i++) {
-			free(untrigger_filters[i]);
-		}
-		free(untrigger_filters);
-	}
 
 	free(line);
 

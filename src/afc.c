@@ -78,12 +78,12 @@ LIBIMOBILEDEVICE_API afc_error_t afc_client_new_with_service_client(service_clie
 	client_loc->free_parent = 0;
 
 	/* allocate a packet */
-	client_loc->afc_packet = (AFCPacket *) malloc(sizeof(AFCPacket));
+	client_loc->packet_extra = 1024;
+	client_loc->afc_packet = (AFCPacket *) malloc(sizeof(AFCPacket) + client_loc->packet_extra);
 	if (!client_loc->afc_packet) {
 		free(client_loc);
 		return AFC_E_NO_MEM;
 	}
-
 	client_loc->afc_packet->packet_num = 0;
 	client_loc->afc_packet->entire_length = 0;
 	client_loc->afc_packet->this_length = 0;
@@ -157,8 +157,8 @@ static afc_error_t afc_dispatch_packet(afc_client_t client, uint64_t operation, 
 
 	*bytes_sent = 0;
 
-	if (!data || !data_length)
-		data_length = 0;
+	/*if (!data || !data_length)
+		data_length = 0;*/
 	if (!payload || !payload_length)
 		payload_length = 0;
 
@@ -169,27 +169,14 @@ static afc_error_t afc_dispatch_packet(afc_client_t client, uint64_t operation, 
 
 	debug_info("packet length = %i", client->afc_packet->this_length);
 
-	debug_buffer((char*)client->afc_packet, sizeof(AFCPacket));
-
-	/* send AFC packet header */
+	/* send AFC packet header and data */
 	AFCPacket_to_LE(client->afc_packet);
+	debug_buffer((char*)client->afc_packet, sizeof(AFCPacket) + data_length);
 	sent = 0;
-	service_send(client->parent, (void*)client->afc_packet, sizeof(AFCPacket), &sent);
+	service_send(client->parent, (void*)client->afc_packet, sizeof(AFCPacket) + data_length, &sent);
 	AFCPacket_from_LE(client->afc_packet);
 	*bytes_sent += sent;
-	if (sent < sizeof(AFCPacket)) {
-		return AFC_E_SUCCESS;
-	}
-
-	/* send AFC packet data (if there's data to send) */
-	sent = 0;
-	if (data_length > 0) {
-		debug_info("packet data follows");
-		debug_buffer(data, data_length);
-		service_send(client->parent, data, data_length, &sent);
-	}
-	*bytes_sent += sent;
-	if (sent < data_length) {
+	if (sent < sizeof(AFCPacket) + data_length) {
 		return AFC_E_SUCCESS;
 	}
 
@@ -400,6 +387,21 @@ static char **make_strings_list(char *tokens, uint32_t length)
 	return list;
 }
 
+static int _afc_check_packet_buffer(afc_client_t client, uint32_t data_len)
+{
+	if (data_len > client->packet_extra) {
+		client->packet_extra = (data_len & ~8) + 8;
+		AFCPacket* newpkt = (AFCPacket*)realloc(client->afc_packet, sizeof(AFCPacket) + client->packet_extra);
+		if (!newpkt) {
+			return -1;
+		}
+		client->afc_packet = newpkt;
+	}
+	return 0;
+}
+
+#define AFC_PACKET_DATA_PTR ((char*)client->afc_packet + sizeof(AFCPacket))
+
 LIBIMOBILEDEVICE_API afc_error_t afc_read_directory(afc_client_t client, const char *path, char ***directory_information)
 {
 	uint32_t bytes = 0;
@@ -411,8 +413,16 @@ LIBIMOBILEDEVICE_API afc_error_t afc_read_directory(afc_client_t client, const c
 
 	afc_lock(client);
 
+	uint32_t data_len = (uint32_t)strlen(path)+1;
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
+
 	/* Send the command */
-	ret = afc_dispatch_packet(client, AFC_OP_READ_DIR, path, strlen(path)+1, NULL, 0, &bytes);
+	memcpy(AFC_PACKET_DATA_PTR, path, data_len);
+	ret = afc_dispatch_packet(client, AFC_OP_READ_DIR, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -510,8 +520,17 @@ LIBIMOBILEDEVICE_API afc_error_t afc_remove_path(afc_client_t client, const char
 
 	afc_lock(client);
 
+	uint32_t data_len = (uint32_t)strlen(path)+1;
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
+
 	/* Send command */
-	ret = afc_dispatch_packet(client, AFC_OP_REMOVE_PATH, path, strlen(path)+1, NULL, 0, &bytes);
+	debug_info("We got %p and %p", client->afc_packet, AFC_PACKET_DATA_PTR);
+	memcpy(AFC_PACKET_DATA_PTR, path, data_len);
+	ret = afc_dispatch_packet(client, AFC_OP_REMOVE_PATH, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -533,18 +552,25 @@ LIBIMOBILEDEVICE_API afc_error_t afc_rename_path(afc_client_t client, const char
 	if (!client || !from || !to || !client->afc_packet || !client->parent)
 		return AFC_E_INVALID_ARG;
 
-	char *buffer = (char *) malloc(sizeof(char) * (strlen(from) + strlen(to) + 1 + sizeof(uint32_t)));
 	uint32_t bytes = 0;
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
+	size_t from_len = strlen(from);
+	size_t to_len = strlen(to);
+
 	afc_lock(client);
 
-	/* Send command */
-	memcpy(buffer, from, strlen(from) + 1);
-	memcpy(buffer + strlen(from) + 1, to, strlen(to) + 1);
-	ret = afc_dispatch_packet(client, AFC_OP_RENAME_PATH, buffer, strlen(to)+1 + strlen(from)+1, NULL, 0, &bytes);
-	free(buffer);
+	uint32_t data_len = (uint32_t)(from_len+1 + to_len+1);
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
 
+	/* Send command */
+	memcpy(AFC_PACKET_DATA_PTR, from, from_len+1);
+	memcpy(AFC_PACKET_DATA_PTR + from_len+1, to, to_len+1);
+	ret = afc_dispatch_packet(client, AFC_OP_RENAME_PATH, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -567,8 +593,16 @@ LIBIMOBILEDEVICE_API afc_error_t afc_make_directory(afc_client_t client, const c
 
 	afc_lock(client);
 
+	uint32_t data_len = (uint32_t)strlen(path)+1;
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
+
 	/* Send command */
-	ret = afc_dispatch_packet(client, AFC_OP_MAKE_DIR, path, strlen(path)+1, NULL, 0, &bytes);
+	memcpy(AFC_PACKET_DATA_PTR, path, data_len);
+	ret = afc_dispatch_packet(client, AFC_OP_MAKE_DIR, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -592,8 +626,18 @@ LIBIMOBILEDEVICE_API afc_error_t afc_get_file_info(afc_client_t client, const ch
 
 	afc_lock(client);
 
+	uint32_t data_len = (uint32_t)strlen(path)+1;
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
+
+	debug_info("We got %p and %p", client->afc_packet, AFC_PACKET_DATA_PTR);
+
 	/* Send command */
-	ret = afc_dispatch_packet(client, AFC_OP_GET_FILE_INFO, path, strlen(path)+1, NULL, 0, &bytes);
+	memcpy(AFC_PACKET_DATA_PTR, path, data_len);
+	ret = afc_dispatch_packet(client, AFC_OP_GET_FILE_INFO, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -616,9 +660,8 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_open(afc_client_t client, const char *
 	if (!client || !client->parent || !client->afc_packet)
 		return AFC_E_INVALID_ARG;
 
-	uint64_t file_mode_loc = htole64(file_mode);
+	//uint64_t file_mode_loc = htole64(file_mode);
 	uint32_t bytes = 0;
-	char *data = (char *) malloc(sizeof(char) * (8 + strlen(filename) + 1));
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
 	/* set handle to 0 so in case an error occurs, the handle is invalid */
@@ -626,20 +669,25 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_open(afc_client_t client, const char *
 
 	afc_lock(client);
 
-	/* Send command */
-	memcpy(data, &file_mode_loc, 8);
-	memcpy(data + 8, filename, strlen(filename));
-	data[8 + strlen(filename)] = '\0';
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_OPEN, data, 8 + strlen(filename) + 1, NULL, 0, &bytes);
-	free(data);
+	uint32_t data_len = (uint32_t)(strlen(filename)+1 + 8);
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
 
+	/* Send command */
+	//memcpy(AFC_PACKET_DATA_PTR, &file_mode_loc, 8);
+	*(uint64_t*)(AFC_PACKET_DATA_PTR) = htole64(file_mode);
+	memcpy(AFC_PACKET_DATA_PTR + 8, filename, data_len-8);
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_OPEN, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		debug_info("Didn't receive a response to the command");
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
 	}
 	/* Receive the data */
-	data = NULL;
+	char* data = NULL;
 	ret = afc_receive_data(client, &data, &bytes);
 	if ((ret == AFC_E_SUCCESS) && (bytes > 0) && data) {
 		afc_unlock(client);
@@ -663,23 +711,25 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_read(afc_client_t client, uint64_t han
 {
 	char *input = NULL;
 	uint32_t current_count = 0, bytes_loc = 0;
+	struct readinfo {
+		uint64_t handle;
+		uint64_t size;
+	};
 	afc_error_t ret = AFC_E_SUCCESS;
 
 	if (!client || !client->afc_packet || !client->parent || handle == 0)
 		return AFC_E_INVALID_ARG;
 	debug_info("called for length %i", length);
 
+	//uint32_t data_len = 8 + 8;
+
 	afc_lock(client);
 
 	/* Send the read command */
-	struct {
-		uint64_t handle;
-		uint64_t size;
-	} readinfo;
-	readinfo.handle = handle;
-	readinfo.size = htole64(length);
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_READ, (const char*)&readinfo, sizeof(readinfo), NULL, 0, &bytes_loc);
-
+	struct readinfo* readinfo = (struct readinfo*)(AFC_PACKET_DATA_PTR);
+	readinfo->handle = handle;
+	readinfo->size = htole64(length);
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_READ, NULL, sizeof(struct readinfo), NULL, 0, &bytes_loc);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -721,11 +771,14 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_write(afc_client_t client, uint64_t ha
 	if (!client || !client->afc_packet || !client->parent || !bytes_written || (handle == 0))
 		return AFC_E_INVALID_ARG;
 
+	uint32_t data_len = 8;
+
 	afc_lock(client);
 
 	debug_info("Write length: %i", length);
 
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_WRITE, (const char*)&handle, 8, data, length, &bytes_loc);
+	*(uint64_t*)(AFC_PACKET_DATA_PTR) = handle;
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_WRITE, NULL, data_len, data, length, &bytes_loc);
 
 	current_count += bytes_loc - (sizeof(AFCPacket) + 8);
 
@@ -752,12 +805,15 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_close(afc_client_t client, uint64_t ha
 	if (!client || (handle == 0))
 		return AFC_E_INVALID_ARG;
 
+	uint32_t data_len = 8;
+
 	afc_lock(client);
 
 	debug_info("File handle %i", handle);
 
 	/* Send command */
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_CLOSE, (const char*)&handle, 8, NULL, 0, &bytes);
+	*(uint64_t*)(AFC_PACKET_DATA_PTR) = handle;
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_CLOSE, NULL, data_len, NULL, 0, &bytes);
 
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
@@ -775,10 +831,10 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_close(afc_client_t client, uint64_t ha
 LIBIMOBILEDEVICE_API afc_error_t afc_file_lock(afc_client_t client, uint64_t handle, afc_lock_op_t operation)
 {
 	uint32_t bytes = 0;
-	struct {
+	struct lockinfo {
 		uint64_t handle;
 		uint64_t op;
-	} lockinfo;
+	};
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
 	if (!client || (handle == 0))
@@ -789,10 +845,10 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_lock(afc_client_t client, uint64_t han
 	debug_info("file handle %i", handle);
 
 	/* Send command */
-	lockinfo.handle = handle;
-	lockinfo.op = htole64(operation);
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_LOCK, (const char*)&lockinfo, sizeof(lockinfo), NULL, 0, &bytes);
-
+	struct lockinfo* lockinfo = (struct lockinfo*)(AFC_PACKET_DATA_PTR);
+	lockinfo->handle = handle;
+	lockinfo->op = htole64(operation);
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_LOCK, NULL, sizeof(struct lockinfo), NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		debug_info("could not send lock command");
@@ -809,11 +865,11 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_lock(afc_client_t client, uint64_t han
 LIBIMOBILEDEVICE_API afc_error_t afc_file_seek(afc_client_t client, uint64_t handle, int64_t offset, int whence)
 {
 	uint32_t bytes = 0;
-	struct {
+	struct seekinfo {
 		uint64_t handle;
 		uint64_t whence;
 		int64_t offset;
-	} seekinfo;
+	};
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
 	if (!client || (handle == 0))
@@ -822,10 +878,11 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_seek(afc_client_t client, uint64_t han
 	afc_lock(client);
 
 	/* Send the command */
-	seekinfo.handle = handle;
-	seekinfo.whence = htole64(whence);
-	seekinfo.offset = (int64_t)htole64(offset);
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_SEEK, (const char*)&seekinfo, sizeof(seekinfo), NULL, 0, &bytes);
+	struct seekinfo* seekinfo = (struct seekinfo*)(AFC_PACKET_DATA_PTR);
+	seekinfo->handle = handle;
+	seekinfo->whence = htole64(whence);
+	seekinfo->offset = (int64_t)htole64(offset);
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_SEEK, NULL, sizeof(struct seekinfo), NULL, 0, &bytes);
 
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
@@ -848,11 +905,13 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_tell(afc_client_t client, uint64_t han
 	if (!client || (handle == 0))
 		return AFC_E_INVALID_ARG;
 
+	uint32_t data_len = 8;
+
 	afc_lock(client);
 
 	/* Send the command */
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_TELL, (const char*)&handle, 8, NULL, 0, &bytes);
-
+	*(uint64_t*)(AFC_PACKET_DATA_PTR) = handle;
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_TELL, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -875,10 +934,10 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_tell(afc_client_t client, uint64_t han
 LIBIMOBILEDEVICE_API afc_error_t afc_file_truncate(afc_client_t client, uint64_t handle, uint64_t newsize)
 {
 	uint32_t bytes = 0;
-	struct {
+	struct truncinfo {
 		uint64_t handle;
 		uint64_t newsize;
-	} truncinfo;
+	};
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
 	if (!client || (handle == 0))
@@ -887,9 +946,10 @@ LIBIMOBILEDEVICE_API afc_error_t afc_file_truncate(afc_client_t client, uint64_t
 	afc_lock(client);
 
 	/* Send command */
-	truncinfo.handle = handle;
-	truncinfo.newsize = htole64(newsize);
-	ret = afc_dispatch_packet(client, AFC_OP_FILE_SET_SIZE, (const char*)&truncinfo, sizeof(truncinfo), NULL, 0, &bytes);
+	struct truncinfo* truncinfo = (struct truncinfo*)(AFC_PACKET_DATA_PTR);
+	truncinfo->handle = handle;
+	truncinfo->newsize = htole64(newsize);
+	ret = afc_dispatch_packet(client, AFC_OP_FILE_SET_SIZE, NULL, sizeof(struct truncinfo), NULL, 0, &bytes);
 
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
@@ -908,19 +968,22 @@ LIBIMOBILEDEVICE_API afc_error_t afc_truncate(afc_client_t client, const char *p
 	if (!client || !path || !client->afc_packet || !client->parent)
 		return AFC_E_INVALID_ARG;
 
-	char *buffer = (char *) malloc(sizeof(char) * (strlen(path) + 1 + 8));
 	uint32_t bytes = 0;
-	uint64_t size_requested = htole64(newsize);
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
 	afc_lock(client);
 
-	/* Send command */
-	memcpy(buffer, &size_requested, 8);
-	memcpy(buffer + 8, path, strlen(path) + 1);
-	ret = afc_dispatch_packet(client, AFC_OP_TRUNCATE, buffer, 8 + strlen(path) + 1, NULL, 0, &bytes);
-	free(buffer);
+	uint32_t data_len = 8 + (uint32_t)(strlen(path)+1);
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
 
+	/* Send command */
+	*(uint64_t*)(AFC_PACKET_DATA_PTR) = htole64(newsize);
+	memcpy(AFC_PACKET_DATA_PTR + 8, path, data_len-8);
+	ret = afc_dispatch_packet(client, AFC_OP_TRUNCATE, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -938,23 +1001,31 @@ LIBIMOBILEDEVICE_API afc_error_t afc_make_link(afc_client_t client, afc_link_typ
 	if (!client || !target || !linkname || !client->afc_packet || !client->parent)
 		return AFC_E_INVALID_ARG;
 
-	char *buffer = (char *) malloc(sizeof(char) * (strlen(target)+1 + strlen(linkname)+1 + 8));
 	uint32_t bytes = 0;
 	uint64_t type = htole64(linktype);
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
+	size_t target_len = strlen(target);
+	size_t link_len = strlen(linkname);
+
 	afc_lock(client);
 
+	uint32_t data_len = 8 + target_len + 1 + link_len + 1;
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
+
 	debug_info("link type: %lld", type);
-	debug_info("target: %s, length:%d", target, strlen(target));
-	debug_info("linkname: %s, length:%d", linkname, strlen(linkname));
+	debug_info("target: %s, length:%d", target, target_len);
+	debug_info("linkname: %s, length:%d", linkname, link_len);
 
 	/* Send command */
-	memcpy(buffer, &type, 8);
-	memcpy(buffer + 8, target, strlen(target) + 1);
-	memcpy(buffer + 8 + strlen(target) + 1, linkname, strlen(linkname) + 1);
-	ret = afc_dispatch_packet(client, AFC_OP_MAKE_LINK, buffer, 8 + strlen(linkname) + 1 + strlen(target) + 1, NULL, 0, &bytes);
-	free(buffer);
+	*(uint64_t*)(AFC_PACKET_DATA_PTR) = htole64(linktype);
+	memcpy(AFC_PACKET_DATA_PTR + 8, target, target_len + 1);
+	memcpy(AFC_PACKET_DATA_PTR + 8 + target_len + 1, linkname, link_len + 1);
+	ret = afc_dispatch_packet(client, AFC_OP_MAKE_LINK, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -972,18 +1043,22 @@ LIBIMOBILEDEVICE_API afc_error_t afc_set_file_time(afc_client_t client, const ch
 	if (!client || !path || !client->afc_packet || !client->parent)
 		return AFC_E_INVALID_ARG;
 
-	char *buffer = (char *) malloc(sizeof(char) * (strlen(path) + 1 + 8));
 	uint32_t bytes = 0;
-	uint64_t mtime_loc = htole64(mtime);
 	afc_error_t ret = AFC_E_UNKNOWN_ERROR;
 
 	afc_lock(client);
 
+	uint32_t data_len = 8 + strlen(path) + 1;
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
+
 	/* Send command */
-	memcpy(buffer, &mtime_loc, 8);
-	memcpy(buffer + 8, path, strlen(path) + 1);
-	ret = afc_dispatch_packet(client, AFC_OP_SET_FILE_MOD_TIME, buffer, 8 + strlen(path) + 1, NULL, 0, &bytes);
-	free(buffer);
+	*(uint64_t*)(AFC_PACKET_DATA_PTR) = htole64(mtime);
+	memcpy(AFC_PACKET_DATA_PTR + 8, path, data_len-8);
+	ret = afc_dispatch_packet(client, AFC_OP_SET_FILE_MOD_TIME, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
@@ -1006,8 +1081,16 @@ LIBIMOBILEDEVICE_API afc_error_t afc_remove_path_and_contents(afc_client_t clien
 
 	afc_lock(client);
 
+	uint32_t data_len = strlen(path) + 1;
+	if (_afc_check_packet_buffer(client, data_len) < 0) {
+		afc_unlock(client);
+		debug_info("Failed to realloc packet buffer");
+		return AFC_E_NO_MEM;
+	}
+
 	/* Send command */
-	ret = afc_dispatch_packet(client, AFC_OP_REMOVE_PATH_AND_CONTENTS, path, strlen(path)+1, NULL, 0, &bytes);
+	memcpy(AFC_PACKET_DATA_PTR, path, data_len);
+	ret = afc_dispatch_packet(client, AFC_OP_REMOVE_PATH_AND_CONTENTS, NULL, data_len, NULL, 0, &bytes);
 	if (ret != AFC_E_SUCCESS) {
 		afc_unlock(client);
 		return AFC_E_NOT_ENOUGH_DATA;
